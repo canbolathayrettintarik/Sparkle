@@ -22,6 +22,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
+import ctypes
+import dataclasses
 import ipaddress
 import json
 import logging
@@ -32,6 +35,7 @@ import socket
 import ssl
 import sys
 import time
+from importlib.util import find_spec
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,6 +48,22 @@ except ImportError as exc:
     AIOHTTP_IMPORT_ERROR = exc
 else:
     AIOHTTP_IMPORT_ERROR = None
+
+try:
+    import httpx
+except ImportError as exc:
+    httpx = None  # type: ignore[assignment]
+    HTTPX_IMPORT_ERROR = exc
+else:
+    HTTPX_IMPORT_ERROR = None
+
+try:
+    from asyncio_throttle import Throttler
+except ImportError as exc:
+    Throttler = None  # type: ignore[assignment]
+    THROTTLE_IMPORT_ERROR = exc
+else:
+    THROTTLE_IMPORT_ERROR = None
 
 try:
     from colorama import Fore, Style, init
@@ -63,6 +83,17 @@ DEFAULT_CONNECT_TIMEOUT = 1.5
 DEFAULT_BANNER_TIMEOUT = 3.0
 DEFAULT_PORT_CONCURRENCY = 500
 DEFAULT_SERVICE_CONCURRENCY = 50
+DEFAULT_UDP_TIMEOUT = 2.0
+MAX_HTTP_READ_BYTES = 8192
+MAX_BANNER_READ_BYTES = 1024
+MIN_PRINTABLE_RATIO = 0.7
+TCP_SYN_ACK_FLAGS = 0x12
+MAX_CVE_DESCRIPTION_LENGTH = 160
+MAX_CVE_RESULTS_PER_QUERY = 3
+NVD_FREE_RATE_LIMIT = 90
+NVD_API_KEY_RATE_LIMIT = 2000
+NVD_RATE_PERIOD_SECONDS = 300
+UDP_SCAN_PORTS = (53, 161, 1900)
 
 SENSITIVE_PATHS = [
     "/.env",
@@ -185,6 +216,47 @@ TLS_PORT_HINTS = {
     443, 465, 563, 587, 636, 853, 989, 990, 992, 993, 995, 8443, 8834, 9443,
 }
 
+UDP_PROBES: dict[int, bytes] = {
+    53: b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07version\x04bind\x00\x00\x10\x00\x03",
+    161: b"\x30\x26\x02\x01\x01\x04\x06public\xa0\x19\x02\x04\x70\x69\x6e\x67\x02\x01\x00\x02\x01\x00\x30\x0b\x30\x09\x06\x05\x2b\x06\x01\x02\x01\x05\x00",
+    1900: (
+        b"M-SEARCH * HTTP/1.1\r\n"
+        b"HOST: 239.255.255.250:1900\r\n"
+        b"MAN: \"ssdp:discover\"\r\n"
+        b"MX: 1\r\n"
+        b"ST: ssdp:all\r\n\r\n"
+    ),
+}
+
+UDP_SERVICE_HINTS = {
+    53: "dns",
+    161: "snmp",
+    1900: "ssdp",
+}
+
+LOW_CONFIDENCE_PORT_HINTS: dict[int, tuple[str, str]] = {
+    9929: ("nping-echo", "Nping Echo service (port heuristic)"),
+    31337: ("elite", "Port-based heuristic on 31337/tcp"),
+}
+
+CPE_PRODUCT_MAP: dict[str, tuple[str, str]] = {
+    "apache": ("apache", "http_server"),
+    "apache httpd": ("apache", "http_server"),
+    "apache tomcat": ("apache", "tomcat"),
+    "nginx": ("nginx", "nginx"),
+    "openssh": ("openbsd", "openssh"),
+    "open ssh": ("openbsd", "openssh"),
+    "microsoft-iis": ("microsoft", "iis"),
+    "microsoft iis": ("microsoft", "iis"),
+    "iis": ("microsoft", "iis"),
+    "mysql": ("oracle", "mysql"),
+    "mariadb": ("mariadb", "mariadb"),
+    "postgresql": ("postgresql", "postgresql"),
+    "proftpd": ("proftpd", "proftpd"),
+    "vsftpd": ("vsftpd", "vsftpd"),
+    "pure-ftpd": ("pureftpd", "pure-ftpd"),
+}
+
 
 def load_scapy():
     try:
@@ -192,6 +264,10 @@ def load_scapy():
     except ImportError as exc:
         raise RuntimeError("Scapy is required for --syn scans. Install it with: pip install scapy") from exc
     return IP, IPv6, TCP, conf, sr, sr1
+
+
+def scapy_is_available() -> bool:
+    return find_spec("scapy") is not None
 
 
 @dataclass(slots=True)
@@ -287,6 +363,43 @@ def result_color(result: ServiceResult) -> str:
     return Fore.WHITE
 
 
+def has_elevated_privileges() -> bool:
+    if os.name == "nt":
+        try:
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return False
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        return False
+    try:
+        return geteuid() == 0
+    except Exception:
+        return False
+
+
+def format_banner_bytes(raw: bytes, max_text: int = 120, max_hex: int = 24) -> str:
+    if not raw:
+        return "open, no banner"
+
+    printable_count = sum(1 for byte in raw if 32 <= byte <= 126 or byte in (9, 10, 13))
+    if printable_count / len(raw) < MIN_PRINTABLE_RATIO:
+        hex_blob = raw[:max_hex].hex().upper()
+        if len(raw) > max_hex:
+            hex_blob += "..."
+        return f"<Binary Data: {hex_blob}>"
+
+    printable = "".join(chr(byte) if 32 <= byte <= 126 else " " for byte in raw)
+    printable = re.sub(r"\s+", " ", printable).strip()
+    if printable:
+        return trim_text(printable, max_text)
+
+    hex_blob = raw[:max_hex].hex().upper()
+    if len(raw) > max_hex:
+        hex_blob += "..."
+    return f"<Binary Data: {hex_blob}>"
+
+
 def resolve_target(host: str) -> Target:
     try:
         records = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
@@ -332,21 +445,37 @@ def estimate_os_from_ttl(ttl: int, window: int, options: list[tuple]) -> str:
     option_map = {key: value for key, value in options if isinstance(key, str)}
     mss = option_map.get("MSS")
     wscale = option_map.get("WScale")
+    option_names = [item[0] for item in options if isinstance(item, tuple) and item]
+    compact_options = [name for name in option_names if name != "EOL"]
+
+    linux_order = ["MSS", "SAckOK", "Timestamp", "NOP", "WScale"]
+    windows_order = ["MSS", "NOP", "WScale", "NOP", "NOP", "SAckOK"]
+
+    def has_order(expected: list[str]) -> bool:
+        cursor = 0
+        for name in compact_options:
+            if cursor < len(expected) and name == expected[cursor]:
+                cursor += 1
+        return cursor == len(expected)
 
     if ttl <= 64:
+        if has_order(linux_order):
+            return "Linux-like (high)"
         if window == 65535 and wscale in {4, 5, 6}:
-            return "macOS/FreeBSD-like"
+            return "macOS/FreeBSD-like (medium)"
         if mss == 1460 and wscale in {7, 8}:
-            return "Linux-like"
-        return "Unix-like"
+            return "Linux-like (medium)"
+        return "Unix-like (low)"
     if ttl <= 128:
+        if has_order(windows_order):
+            return "Windows-like (high)"
         if window in {8192, 16384, 64240, 65535}:
-            return "Windows-like"
-        return "Windows or embedded device"
+            return "Windows-like (medium)"
+        return "Windows or embedded device (low)"
     if ttl <= 255:
         if window == 4128:
-            return "Cisco IOS-like"
-        return "network device or Unix-like"
+            return "Cisco IOS-like (medium)"
+        return "network device or Unix-like (low)"
     return "unknown"
 
 
@@ -392,6 +521,65 @@ class AsyncConnectScanner:
         return sorted(open_ports)
 
 
+class _UdpProbeProtocol(asyncio.DatagramProtocol):
+    def __init__(self) -> None:
+        self.transport: asyncio.DatagramTransport | None = None
+        self.response: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, _addr) -> None:
+        if not self.response.done():
+            self.response.set_result(data)
+
+    def error_received(self, exc: Exception) -> None:
+        if not self.response.done():
+            self.response.set_exception(exc)
+
+
+class UdpScanner:
+    def __init__(self, target: Target, timeout: float = DEFAULT_UDP_TIMEOUT) -> None:
+        self.target = target
+        self.timeout = timeout
+
+    async def _probe(self, port: int) -> ServiceResult | None:
+        loop = asyncio.get_running_loop()
+        transport = None
+        try:
+            transport, protocol = await loop.create_datagram_endpoint(
+                _UdpProbeProtocol,
+                remote_addr=(self.target.address, port),
+                family=self.target.family,
+            )
+            transport.sendto(UDP_PROBES[port])
+            raw = await asyncio.wait_for(protocol.response, timeout=self.timeout)
+        except (OSError, asyncio.TimeoutError):
+            return None
+        finally:
+            if transport is not None:
+                transport.close()
+
+        service = UDP_SERVICE_HINTS.get(port, "udp")
+        return ServiceResult(
+            port=port,
+            service=service,
+            version=format_banner_bytes(raw, max_text=80, max_hex=20),
+            transport="udp",
+            tls=False,
+        )
+
+    async def scan(self) -> dict[int, ServiceResult]:
+        print_stage("UDP Scan", f"Ports: {', '.join(str(port) for port in UDP_SCAN_PORTS)} | Timeout: {self.timeout:.2f}s")
+        results = await asyncio.gather(*(self._probe(port) for port in UDP_SCAN_PORTS), return_exceptions=True)
+        open_udp: dict[int, ServiceResult] = {}
+        for item in results:
+            if isinstance(item, ServiceResult):
+                open_udp[item.port] = item
+        print(Fore.GREEN + f"UDP responders found: {len(open_udp)}")
+        return open_udp
+
+
 class SynScanner:
     def __init__(self, target: Target, timeout: float, retry: int, batch_size: int) -> None:
         self.IP, self.IPv6, self.TCP, self.conf, self.sr, self.sr1 = load_scapy()
@@ -413,31 +601,35 @@ class SynScanner:
             if not pending:
                 break
 
-            sport = random.randint(1024, 65535)
-            packets = ip_layer / self.TCP(sport=sport, dport=pending, flags="S")
-            answered, unanswered = self.sr(packets, timeout=self.timeout, verbose=0)
+            try:
+                sport = random.randint(1024, 65535)
+                packets = ip_layer / self.TCP(sport=sport, dport=pending, flags="S")
+                answered, unanswered = self.sr(packets, timeout=self.timeout, verbose=0)
 
-            for _sent, received in answered:
-                if not received.haslayer(self.TCP):
-                    continue
-                tcp = received.getlayer(self.TCP)
-                if int(tcp.flags) != 0x12:
-                    continue
+                for _sent, received in answered:
+                    if not received.haslayer(self.TCP):
+                        continue
+                    tcp = received.getlayer(self.TCP)
+                    if int(tcp.flags) != TCP_SYN_ACK_FLAGS:
+                        continue
 
-                port = int(tcp.sport)
-                open_ports.append(port)
+                    port = int(tcp.sport)
+                    open_ports.append(port)
 
-                ttl = 0
-                if received.haslayer(self.IP):
-                    ttl = int(received[self.IP].ttl)
-                elif received.haslayer(self.IPv6):
-                    ttl = int(received[self.IPv6].hlim)
-                self.os_hints[port] = estimate_os_from_ttl(ttl, int(tcp.window), list(tcp.options))
+                    ttl = 0
+                    if received.haslayer(self.IP):
+                        ttl = int(received[self.IP].ttl)
+                    elif received.haslayer(self.IPv6):
+                        ttl = int(received[self.IPv6].hlim)
+                    self.os_hints[port] = estimate_os_from_ttl(ttl, int(tcp.window), list(tcp.options))
 
-                rst = ip_layer / self.TCP(sport=sport, dport=port, flags="R", seq=int(tcp.ack))
-                self.sr1(rst, timeout=0.2, verbose=0)
+                    rst = ip_layer / self.TCP(sport=sport, dport=port, flags="R", seq=int(tcp.ack))
+                    self.sr1(rst, timeout=0.2, verbose=0)
 
-            pending = [int(packet.dport) for packet in unanswered if packet.haslayer(self.TCP)]
+                pending = [int(packet.dport) for packet in unanswered if packet.haslayer(self.TCP)]
+            except Exception as exc:
+                logging.warning("SYN batch error on %s: %s", self.target.address, exc)
+                break
 
         return open_ports
 
@@ -473,31 +665,72 @@ class CveLookup:
         self.enabled = enabled
         self.semaphore = asyncio.Semaphore(concurrency)
         self.cache: dict[str, list[dict[str, str]]] = {}
+        rate_limit = NVD_API_KEY_RATE_LIMIT if os.getenv("NVD_API_KEY") else NVD_FREE_RATE_LIMIT
+        self.throttler = Throttler(rate_limit=rate_limit, period=NVD_RATE_PERIOD_SECONDS)
 
     @staticmethod
     def _query_from_version(service: str, version: str) -> str | None:
-        if version.lower() in {"unknown", "filtered", "no response"}:
+        if version.lower() in {"unknown", "filtered", "no response", "open, no banner", "open, probe failed"}:
             return None
-        cleaned = re.sub(r"\s+", " ", version).strip()
-        cleaned = re.sub(r"[\r\n].*", "", cleaned)
-        cleaned = cleaned[:80]
-        if len(cleaned) < 4:
+        if version.startswith("<Binary Data:"):
             return None
-        if service == "http" and cleaned.lower().startswith("http/"):
+
+        parsed = CveLookup._extract_cpe_parts(service, version)
+        if parsed is None:
             return None
-        return cleaned
+
+        vendor, product, product_version = parsed
+        return f"cpe:2.3:a:{vendor}:{product}:{product_version}:*:*:*:*:*:*:*"
+
+    @staticmethod
+    def _extract_cpe_parts(service: str, version: str) -> tuple[str, str, str] | None:
+        cleaned = re.sub(r"[\r\n].*", "", version).strip()
+        cleaned = re.sub(r"\([^)]*\)", "", cleaned)
+        cleaned = re.sub(r"[,;]+", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if not cleaned or cleaned.startswith("<Binary Data:"):
+            return None
+
+        candidates = [
+            r"(?P<product>[A-Za-z][A-Za-z0-9+_. -]+)/(?P<version>\d+(?:[._-]\d+)*(?:[A-Za-z0-9._-]*)?)",
+            r"(?P<product>OpenSSH)[-_](?P<version>\d+(?:[._-]\d+)*(?:[A-Za-z0-9._-]*)?)",
+            r"(?P<product>[A-Za-z][A-Za-z0-9+_. -]+)\s+(?P<version>\d+(?:[._-]\d+)*(?:[A-Za-z0-9._-]*)?)",
+        ]
+
+        product_name = ""
+        product_version = ""
+        for pattern in candidates:
+            match = re.search(pattern, cleaned, re.IGNORECASE)
+            if match:
+                product_name = re.sub(r"\s+", " ", match.group("product")).strip()
+                product_version = match.group("version").strip()
+                break
+
+        if not product_name or not product_version:
+            return None
+
+        normalized = product_name.lower().replace("_", " ").replace("/", " ").strip()
+        mapped = CPE_PRODUCT_MAP.get(normalized)
+        if mapped is None and service in {"http", "https"}:
+            first_token = normalized.split()[0] if normalized.split() else ""
+            mapped = CPE_PRODUCT_MAP.get(first_token)
+        if mapped is None:
+            return None
+
+        vendor, product = mapped
+        return vendor, product, product_version
 
     async def query(self, service: str, version: str, session: aiohttp.ClientSession) -> list[dict[str, str]]:
         if not self.enabled:
             return []
 
-        keyword = self._query_from_version(service, version)
-        if not keyword:
+        virtual_match = self._query_from_version(service, version)
+        if not virtual_match:
             return []
-        if keyword in self.cache:
-            return self.cache[keyword]
+        if virtual_match in self.cache:
+            return self.cache[virtual_match]
 
-        params = {"keywordSearch": keyword, "resultsPerPage": 3}
+        params = {"virtualMatchString": virtual_match, "resultsPerPage": MAX_CVE_RESULTS_PER_QUERY}
         headers = {}
         api_key = os.getenv("NVD_API_KEY")
         if api_key:
@@ -505,13 +738,15 @@ class CveLookup:
 
         async with self.semaphore:
             try:
-                async with session.get(self.NVD_API, params=params, headers=headers, timeout=8) as response:
-                    if response.status != 200:
-                        self.cache[keyword] = []
-                        return []
-                    payload = await response.json()
-            except (aiohttp.ClientError, asyncio.TimeoutError):
-                self.cache[keyword] = []
+                async with self.throttler:
+                    async with httpx.AsyncClient(timeout=8) as client:
+                        response = await client.get(self.NVD_API, params=params, headers=headers)
+                if response.status_code != 200:
+                    self.cache[virtual_match] = []
+                    return []
+                payload = response.json()
+            except (httpx.HTTPError, asyncio.TimeoutError):
+                self.cache[virtual_match] = []
                 return []
 
         findings = []
@@ -529,11 +764,11 @@ class CveLookup:
                 {
                     "id": cve.get("id", "unknown"),
                     "severity": severity,
-                    "description": description[:160],
+                    "description": description[:MAX_CVE_DESCRIPTION_LENGTH],
                 }
             )
 
-        self.cache[keyword] = findings
+        self.cache[virtual_match] = findings
         return findings
 
 
@@ -545,6 +780,15 @@ class ServiceDetector:
         "f5_bigip": ["bigip", "x-wa-info"],
         "sucuri": ["x-sucuri-id", "sucuri"],
         "imperva": ["incap_ses", "visid_incap"],
+        "modsecurity": ["mod_security", "modsecurity", "owasp"],
+        "reblaze": ["x-reblaze-protection"],
+        "stackpath": ["x-sp-url", "x-sp-edge"],
+        "azion": ["x-azion-", "server: azion"],
+    }
+    ACTIVE_PROBES = {
+        "tls_client_hello": b"\x16\x03\x01\x00\x41\x01\x00\x00\x3D\x03\x03",
+        "rdp_routing_token": b"\x03\x00\x00\x13\x0E\xE0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x00\x00\x00\x00",
+        "smbv2_negotiate": b"\x00\x00\x00\x54\xFE\x53\x4D\x42\x40\x00\x00\x00\x00\x00\x00\x00",
     }
 
     def __init__(
@@ -600,7 +844,8 @@ class ServiceDetector:
 
     @classmethod
     def _detect_waf(cls, headers: dict[str, str]) -> str | None:
-        haystack = "\n".join([*headers.keys(), *headers.values()]).lower()
+        pairs = [f"{key}: {value}" for key, value in headers.items()]
+        haystack = "\n".join([*headers.keys(), *headers.values(), *pairs]).lower()
         for name, signatures in cls.WAF_SIGNATURES.items():
             if any(signature in haystack for signature in signatures):
                 return name
@@ -627,11 +872,47 @@ class ServiceDetector:
         except Exception:
             return False
 
+    @staticmethod
+    def _port_hint_result(port: int, prior_result: ServiceResult) -> ServiceResult | None:
+        hint = LOW_CONFIDENCE_PORT_HINTS.get(port)
+        if hint is None:
+            return None
+
+        service, version = hint
+        notes = list(prior_result.notes)
+        if prior_result.version and prior_result.version not in {"unknown", "open, no banner", "open, probe failed"}:
+            notes.append(f"Original banner: {trim_text(prior_result.version, 80)}")
+        notes.append("Service name assigned by port heuristic")
+        return dataclasses.replace(prior_result, service=service, version=version, notes=notes)
+
     async def _read_greeting(self, reader: asyncio.StreamReader) -> bytes:
         try:
-            return await asyncio.wait_for(reader.read(1024), timeout=min(1.2, self.timeout))
+            return await asyncio.wait_for(reader.read(MAX_BANNER_READ_BYTES), timeout=min(1.2, self.timeout))
         except asyncio.TimeoutError:
             return b""
+
+    async def _first_successful_http_probe(self, port: int) -> ServiceResult | None:
+        tasks = {
+            asyncio.create_task(self._probe_http(port, tls=True)),
+            asyncio.create_task(self._probe_http(port, tls=False)),
+        }
+        try:
+            pending = tasks
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    result = task.result()
+                    if result is not None:
+                        for pending_task in pending:
+                            pending_task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        return result
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _probe_http(
         self,
@@ -648,7 +929,7 @@ class ServiceDetector:
 
             writer.write(self._http_request(port))
             await writer.drain()
-            raw = await asyncio.wait_for(reader.read(8192), timeout=self.timeout)
+            raw = await asyncio.wait_for(reader.read(MAX_HTTP_READ_BYTES), timeout=self.timeout)
             text = raw.decode("utf-8", errors="ignore")
             if not text.startswith("HTTP/"):
                 return None
@@ -681,10 +962,12 @@ class ServiceDetector:
         try:
             reader, writer = await self._open_plain(port)
             greeting = await self._read_greeting(reader)
-            text = greeting.decode("utf-8", errors="ignore").strip()
+            text = format_banner_bytes(greeting)
 
             if text.startswith("SSH-"):
-                return ServiceResult(port=port, service="ssh", version=text.splitlines()[0])
+                match = re.match(r"(SSH-[\d.]+-\S+)", text)
+                version = match.group(1) if match else text.splitlines()[0]
+                return ServiceResult(port=port, service="ssh", version=version)
             if text.startswith("220") and re.search(r"(ftp|filezilla|vsftpd|proftpd)", text, re.IGNORECASE):
                 return ServiceResult(port=port, service="ftp", version=text.splitlines()[0])
             if text.startswith("220") and re.search(r"(smtp|mail|postfix|exim|sendmail)", text, re.IGNORECASE):
@@ -703,8 +986,8 @@ class ServiceDetector:
                 writer = None
                 return http
 
-            if text:
-                return ServiceResult(port=port, service="unknown", version=text[:120])
+            if greeting:
+                return ServiceResult(port=port, service="unknown", version=text)
             return ServiceResult(port=port, service="unknown", version="open, no banner")
         except (OSError, asyncio.TimeoutError):
             return ServiceResult(port=port, service="unknown", version="open, probe failed")
@@ -715,6 +998,37 @@ class ServiceDetector:
                     await writer.wait_closed()
                 except Exception:
                     pass
+
+    async def _probe_active_payloads(self, port: int) -> ServiceResult | None:
+        for probe_name, payload in self.ACTIVE_PROBES.items():
+            reader = writer = None
+            try:
+                reader, writer = await self._open_plain(port)
+                writer.write(payload)
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(MAX_BANNER_READ_BYTES), timeout=min(1.5, self.timeout))
+                if not raw:
+                    continue
+
+                if raw.startswith((b"\x15\x03", b"\x16\x03")):
+                    return ServiceResult(port=port, service="tls", version="TLS/SSL service", tls=True)
+                if b"\x03\x00\x00" in raw[:8]:
+                    return ServiceResult(port=port, service="rdp", version="Microsoft Remote Desktop")
+                if b"\xFE\x53\x4D\x42" in raw or b"\xFF\x53\x4D\x42" in raw:
+                    return ServiceResult(port=port, service="smb", version="Microsoft SMB service")
+
+                version = f"{probe_name}: {format_banner_bytes(raw, max_text=72, max_hex=20)}"
+                return ServiceResult(port=port, service="proprietary", version=version)
+            except (OSError, asyncio.TimeoutError):
+                continue
+            finally:
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+        return None
 
     async def _check_sensitive_paths(
         self,
@@ -733,7 +1047,7 @@ class ServiceDetector:
 
         findings: list[WebFinding] = []
         timeout = aiohttp.ClientTimeout(total=self.timeout)
-        for path in SENSITIVE_PATHS:
+        async def fetch_path(path: str) -> WebFinding | None:
             try:
                 async with session.get(
                     base_url + path,
@@ -744,16 +1058,23 @@ class ServiceDetector:
                 ) as response:
                     body = await response.read()
                     if response.status == 200:
-                        findings.append(
-                            WebFinding(
-                                path=path,
-                                status=response.status,
-                                size=len(body),
-                                content_type=response.headers.get("content-type", ""),
-                            )
+                        return WebFinding(
+                            path=path,
+                            status=response.status,
+                            size=len(body),
+                            content_type=response.headers.get("content-type", ""),
                         )
+                    return None
             except (aiohttp.ClientError, asyncio.TimeoutError):
-                continue
+                return None
+
+        path_results = await asyncio.gather(
+            *(fetch_path(path) for path in SENSITIVE_PATHS),
+            return_exceptions=True,
+        )
+        for item in path_results:
+            if isinstance(item, WebFinding):
+                findings.append(item)
         return findings
 
     async def detect_one(
@@ -765,8 +1086,7 @@ class ServiceDetector:
         async with semaphore:
             result: ServiceResult | None = None
 
-            if port in TLS_PORT_HINTS:
-                result = await self._probe_http(port, tls=True)
+            result = await self._first_successful_http_probe(port)
             if result is None:
                 result = await self._probe_known_greeting(port)
             if result.service == "unknown" and port in WEB_PORT_HINTS:
@@ -775,6 +1095,21 @@ class ServiceDetector:
                 tls_result = await self._probe_http(port, tls=True)
                 if tls_result is not None:
                     result = tls_result
+            if result.service == "unknown" and (
+                result.version in {"open, no banner", "open, probe failed"}
+                or result.version.startswith("<Binary Data:")
+            ):
+                active_result = await self._probe_active_payloads(port)
+                if active_result is not None:
+                    if active_result.service in {"tls", "rdp", "smb"}:
+                        result = active_result
+                    elif result.version in {"open, no banner", "open, probe failed"}:
+                        result = active_result
+
+            if result.service == "unknown":
+                hinted_result = self._port_hint_result(port, result)
+                if hinted_result is not None:
+                    result = hinted_result
 
             result.sensitive_paths = await self._check_sensitive_paths(result, session)
             result.cves = await self.cve_lookup.query(result.service, result.version, session)
@@ -835,6 +1170,14 @@ class BlueScanner:
         self.args = args
         self.target = resolve_target(args.target)
         self.ports = parse_ports(args)
+        self.scan_mode = self._select_scan_mode()
+
+    def _select_scan_mode(self) -> str:
+        if self.args.syn:
+            return "syn"
+        if has_elevated_privileges() and scapy_is_available():
+            return "syn"
+        return "connect"
 
     async def run(self) -> int:
         print_banner()
@@ -843,13 +1186,13 @@ class BlueScanner:
             (
                 f"Target: {self.target.original} ({self.target.address}) | "
                 f"Ports selected: {len(self.ports)} | "
-                f"Scan mode: {'SYN' if self.args.syn else 'Connect'}"
+                f"Scan mode: {'SYN' if self.scan_mode == 'syn' else 'Connect'}"
             ),
         )
         logging.info("Scan started for %s (%s)", self.target.original, self.target.address)
 
-        if self.args.syn:
-            open_ports = self._run_syn_scan()
+        if self.scan_mode == "syn":
+            open_ports = await asyncio.get_event_loop().run_in_executor(None, self._run_syn_scan)
             os_hints = getattr(self, "_syn_os_hints", {})
         else:
             scanner = AsyncConnectScanner(
@@ -860,7 +1203,7 @@ class BlueScanner:
             open_ports = await scanner.scan(self.ports)
             os_hints = {}
 
-        if not open_ports:
+        if not open_ports and not self.args.udp:
             print(Fore.YELLOW + "No open TCP ports found.")
             return 0
 
@@ -873,17 +1216,31 @@ class BlueScanner:
             cve_lookup=cve_lookup,
         )
 
-        results = await detector.detect(open_ports)
+        results: dict[int, ServiceResult] = {}
+        if open_ports:
+            results = await detector.detect(open_ports)
         for port, hint in os_hints.items():
             if port in results:
                 results[port].os_hint = hint
+
+        if self.args.udp:
+            udp_results = await UdpScanner(self.target, timeout=self.args.udp_timeout).scan()
+            for port, udp_result in udp_results.items():
+                if port in results:
+                    results[port].notes.append(f"UDP {udp_result.service}: {udp_result.version}")
+                    continue
+                results[port] = udp_result
+
+        if not results:
+            print(Fore.YELLOW + "No open TCP ports or UDP responders found.")
+            return 0
 
         self._print_results(results)
         if self.args.compare:
             self._print_diff(DiffEngine.compare(self.args.compare, results))
 
         report_path = self._write_report(results)
-        print(Fore.CYAN + f"\nJSON report saved: {report_path}")
+        print(Fore.CYAN + f"\nReport saved: {report_path}")
         logging.info("Scan finished for %s", self.target.address)
         return 0
 
@@ -972,18 +1329,43 @@ class BlueScanner:
         safe_target = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.target.address)
         output_dir = Path(self.args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        report_path = output_dir / f"{REPORT_PREFIX}_{safe_target}_{timestamp}.json"
+        extension = {"json": "json", "csv": "csv", "markdown": "md"}[self.args.format]
+        report_path = output_dir / f"{REPORT_PREFIX}_{safe_target}_{timestamp}.{extension}"
 
         payload = {
             "scanner": APP_NAME,
             "target": asdict(self.target),
             "timestamp_utc": timestamp,
-            "scan_mode": "syn" if self.args.syn else "connect",
+            "scan_mode": self.scan_mode,
             "ports": [self._serialize_result(results[port]) for port in sorted(results)],
         }
 
-        with report_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+        if self.args.format == "json":
+            with report_path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        elif self.args.format == "csv":
+            with report_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["port", "service", "version", "cves"])
+                writer.writeheader()
+                for result in (results[port] for port in sorted(results)):
+                    writer.writerow(
+                        {
+                            "port": result.port,
+                            "service": result.service,
+                            "version": result.version,
+                            "cves": ",".join(cve.get("id", "") for cve in result.cves),
+                        }
+                    )
+        else:
+            with report_path.open("w", encoding="utf-8") as handle:
+                handle.write("| Port | Service | Version | CVEs |\n")
+                handle.write("| --- | --- | --- | --- |\n")
+                for result in (results[port] for port in sorted(results)):
+                    cves = ", ".join(cve.get("id", "") for cve in result.cves) or "-"
+                    handle.write(
+                        f"| {result.port}/{result.transport} | {result.service} | "
+                        f"{result.version.replace('|', '/')} | {cves} |\n"
+                    )
 
         return report_path
 
@@ -1012,6 +1394,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-web-checks", action="store_true", help="Disable sensitive web path checks")
     parser.add_argument("--compare", help="Compare against a previous JSON report")
     parser.add_argument("--output-dir", default=".", help="Directory where JSON reports are written")
+    parser.add_argument("--udp", action="store_true", help="Enable basic UDP probes for 53, 161, and 1900")
+    parser.add_argument("--udp-timeout", type=float, default=DEFAULT_UDP_TIMEOUT, help="UDP probe timeout")
+    parser.add_argument("--format", choices=("json", "csv", "markdown"), default="json", help="Report output format")
     return parser
 
 
@@ -1023,7 +1408,17 @@ def main(argv: Iterable[str] | None = None) -> int:
     if AIOHTTP_IMPORT_ERROR is not None:
         raise SystemExit(
             f"Missing dependency: {AIOHTTP_IMPORT_ERROR}. "
-            "Install dependencies with: pip install aiohttp colorama"
+            "Install dependencies with: pip install -r requirements.txt"
+        )
+    if HTTPX_IMPORT_ERROR is not None:
+        raise SystemExit(
+            f"Missing dependency: {HTTPX_IMPORT_ERROR}. "
+            "Install dependencies with: pip install -r requirements.txt"
+        )
+    if THROTTLE_IMPORT_ERROR is not None:
+        raise SystemExit(
+            f"Missing dependency: {THROTTLE_IMPORT_ERROR}. "
+            "Install dependencies with: pip install -r requirements.txt"
         )
 
     try:
