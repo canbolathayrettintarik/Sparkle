@@ -856,9 +856,11 @@ class ServiceDetector:
 
     async def _open_tls(self, port: int) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         context = ssl.create_default_context()
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        server_hostname = self.target.original if not self._looks_like_ip(self.target.original) else None
+        target_is_ip = self._looks_like_ip(self.target.original)
+        server_hostname = None if target_is_ip else self.target.original
+        if target_is_ip:
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
         return await asyncio.wait_for(
             asyncio.open_connection(self.target.address, port, ssl=context, server_hostname=server_hostname),
             timeout=self.timeout,
@@ -871,6 +873,9 @@ class ServiceDetector:
             return True
         except Exception:
             return False
+
+    def _request_ssl_policy(self):
+        return False if self._looks_like_ip(self.target.original) else None
 
     @staticmethod
     def _port_hint_result(port: int, prior_result: ServiceResult) -> ServiceResult | None:
@@ -1052,7 +1057,7 @@ class ServiceDetector:
                 async with session.get(
                     base_url + path,
                     timeout=timeout,
-                    ssl=False,
+                    ssl=self._request_ssl_policy(),
                     allow_redirects=False,
                     headers={"User-Agent": random.choice(USER_AGENTS)},
                 ) as response:
@@ -1117,7 +1122,7 @@ class ServiceDetector:
 
     async def detect(self, ports: list[int]) -> dict[int, ServiceResult]:
         semaphore = asyncio.Semaphore(self.concurrency)
-        connector = aiohttp.TCPConnector(ssl=False, limit=max(self.concurrency, 20))
+        connector = aiohttp.TCPConnector(ssl=self._request_ssl_policy(), limit=max(self.concurrency, 20))
         timeout = aiohttp.ClientTimeout(total=max(self.timeout, 5.0))
         collected: dict[int, ServiceResult] = {}
 
@@ -1140,8 +1145,21 @@ class ServiceDetector:
 
 class DiffEngine:
     @staticmethod
-    def compare(old_report_path: str, current_results: dict[int, ServiceResult]) -> list[str]:
+    def compare(old_report_path: str, current_results: dict[int, ServiceResult], base_dir: str | Path = ".") -> list[str]:
+        base_path = Path(base_dir).resolve()
         path = Path(old_report_path)
+        if not path.is_absolute():
+            path = base_path / path
+        path = path.resolve()
+
+        try:
+            path.relative_to(base_path)
+        except ValueError:
+            return [f"Rejected compare path outside output directory: {path}"]
+
+        if path.suffix.lower() != ".json":
+            return [f"Rejected compare path with non-JSON extension: {path}"]
+
         if not path.exists():
             return [f"Previous report not found: {path}"]
 
@@ -1237,7 +1255,7 @@ class BlueScanner:
 
         self._print_results(results)
         if self.args.compare:
-            self._print_diff(DiffEngine.compare(self.args.compare, results))
+            self._print_diff(DiffEngine.compare(self.args.compare, results, self.args.output_dir))
 
         report_path = self._write_report(results)
         print(Fore.CYAN + f"\nReport saved: {report_path}")
