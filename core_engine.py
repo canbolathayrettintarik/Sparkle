@@ -378,9 +378,9 @@ class ScanState:
     target_hash: str
     started_at: float
     last_updated_at: float
-    completed_ports: list[int] = field(default_factory=list)
-    completed_paths: list[str] = field(default_factory=list)
-    discovered_decoy_paths: list[str] = field(default_factory=list)
+    completed_ports: set[int] = field(default_factory=set)
+    completed_paths: set[str] = field(default_factory=set)
+    discovered_decoy_paths: set[str] = field(default_factory=set)
     egress_cooldowns: dict[str, float] = field(default_factory=dict)
     roe_ref: str | None = None
     version: int = 1
@@ -395,22 +395,22 @@ class ScanState:
             roe_ref=roe_ref,
         )
     def mark_port_done(self, port: int) -> None:
-        if port not in self.completed_ports:
-            self.completed_ports.append(port)
+        self.completed_ports.add(port)
         self.last_updated_at = time.time()
     def mark_path_done(self, path: str) -> None:
-        if path not in self.completed_paths:
-            self.completed_paths.append(path)
+        self.completed_paths.add(path)
         self.last_updated_at = time.time()
     def add_decoy_paths(self, paths: list[str]) -> None:
         for path in paths:
-            if path not in self.discovered_decoy_paths:
-                self.discovered_decoy_paths.append(path)
+            self.discovered_decoy_paths.add(path)
         self.last_updated_at = time.time()
 def save_state(state: ScanState, path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = asdict(state)
+    payload["completed_ports"] = sorted(state.completed_ports)
+    payload["completed_paths"] = sorted(state.completed_paths)
+    payload["discovered_decoy_paths"] = sorted(state.discovered_decoy_paths)
     data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".crimson_state_", suffix=".tmp")
     try:
@@ -440,9 +440,9 @@ def load_state(path: Path) -> ScanState | None:
         target_hash=payload.get("target_hash", ""),
         started_at=payload.get("started_at", time.time()),
         last_updated_at=payload.get("last_updated_at", time.time()),
-        completed_ports=list(payload.get("completed_ports", [])),
-        completed_paths=list(payload.get("completed_paths", [])),
-        discovered_decoy_paths=list(payload.get("discovered_decoy_paths", [])),
+        completed_ports={int(port) for port in payload.get("completed_ports", [])},
+        completed_paths=set(payload.get("completed_paths", [])),
+        discovered_decoy_paths=set(payload.get("discovered_decoy_paths", [])),
         egress_cooldowns=dict(payload.get("egress_cooldowns", {})),
         roe_ref=payload.get("roe_ref"),
         version=int(payload.get("version", 1)),
@@ -535,15 +535,19 @@ class TorControlClient:
         if not lines or not lines[-1].startswith("250 "):
             detail = lines[-1] if lines else "no response"
             raise RuntimeError(f"Tor control command failed during {command}: {detail}")
+    def _send_command(self, sock: socket.socket, reader, command: str, require_ok: bool = True) -> list[str]:
+        sock.sendall((command + "\r\n").encode("utf-8"))
+        lines = self._read_response(reader)
+        if require_ok:
+            self._ensure_ok(lines, command)
+        return lines
     def signal_new_identity(self) -> None:
         try:
             with socket.create_connection((self.host, self.port), timeout=8.0) as sock:
                 reader = sock.makefile("rb")
-                for command in (self._auth_command(), "SIGNAL NEWNYM", "QUIT"):
-                    sock.sendall((command + "\r\n").encode("utf-8"))
-                    lines = self._read_response(reader)
-                    if command != "QUIT":
-                        self._ensure_ok(lines, command)
+                self._send_command(sock, reader, self._auth_command())
+                self._send_command(sock, reader, "SIGNAL NEWNYM")
+                self._send_command(sock, reader, "QUIT", require_ok=False)
         except (OSError, RuntimeError) as exc:
             audit_event("tor_newnym_failed", error=str(exc))
             logging.warning("SIGNAL NEWNYM failed: %s", exc)
@@ -620,8 +624,8 @@ class EgressPool:
             available.sort(key=lambda n: n.last_used)
             picked = available[0]
         else:
-            self._rr_cursor = (self._rr_cursor + 1) % max(len(available), 1)
             picked = available[self._rr_cursor % len(available)]
+            self._rr_cursor = (self._rr_cursor + 1) % len(available)
         picked.last_used = now
         picked.total_requests += 1
         return picked
@@ -800,7 +804,8 @@ class BanSignalAnalyzer:
             sizes = [item[2] for item in bucket if item[2] > 0]
             if len(sizes) >= 5:
                 median_size = statistics.median(sizes)
-                if median_size > 100 and size < median_size * 0.3:
+                current_size = len(body)
+                if median_size > 100 and current_size < median_size * 0.3:
                     soft_reasons.append("soft:size_dropoff")
         for reason in soft_reasons:
             self._soft_count[egress_id] = self._soft_count.get(egress_id, 0) + 1
@@ -897,7 +902,7 @@ async def passive_recon(target_url: str, timeout: float = 5.0) -> list[str]:
     async with aiohttp.ClientSession(timeout=client_timeout, headers=headers) as session:
         for url in candidate_urls:
             try:
-                async with session.get(url, ssl=False, allow_redirects=True) as resp:
+                async with session.get(url, allow_redirects=True) as resp:
                     if resp.status != 200:
                         continue
                     body = await resp.read()
@@ -959,6 +964,7 @@ class WebRequestController:
         self.state_path = state_path
         self.block_events: list[WebBlockEvent] = []
         self._blocked_targets: set[tuple[str, str]] = set()
+        self._socks_sessions: dict[str, aiohttp.ClientSession] = {}
         self._curl_session = None
         if fingerprint and not CURL_CFFI_AVAILABLE:
             logging.warning(
@@ -990,6 +996,22 @@ class WebRequestController:
             save_state(self.state, self.state_path)
         except Exception as exc:
             logging.warning("state persistence failed: %s", exc)
+    async def aclose(self) -> None:
+        sessions = list(self._socks_sessions.values())
+        self._socks_sessions.clear()
+        for session in sessions:
+            if not session.closed:
+                await session.close()
+    def _socks_session(self, proxy_url: str, timeout) -> aiohttp.ClientSession:
+        session = self._socks_sessions.get(proxy_url)
+        if session is not None and not session.closed:
+            return session
+        if ProxyConnector is None:
+            raise RuntimeError("aiohttp_socks not installed")
+        connector = ProxyConnector.from_url(proxy_url)
+        session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+        self._socks_sessions[proxy_url] = session
+        return session
     async def request(
         self,
         session,  # aiohttp.ClientSession
@@ -1097,25 +1119,22 @@ class WebRequestController:
         # SOCKS proxy via aiohttp_socks (new connector per request — pooling
         # would help perf but breaks per-node cooldown semantics)
         if node.url and urlsplit(node.url).scheme.lower() in SOCKS_PROXY_SCHEMES:
-            if ProxyConnector is None:
-                raise RuntimeError("aiohttp_socks not installed")
-            connector = ProxyConnector.from_url(node.url)
-            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as proxy_session:
-                async with proxy_session.get(
-                    url,
-                    timeout=timeout,
-                    ssl=ssl_policy,
-                    allow_redirects=allow_redirects,
-                    headers=headers,
-                ) as response:
-                    body = await response.read()
-                    return WebResponse(
-                        url=url,
-                        status=response.status,
-                        headers=dict(response.headers),
-                        body=body,
-                        proxy=redact_proxy_url(node.url),
-                    )
+            proxy_session = self._socks_session(node.url, timeout)
+            async with proxy_session.get(
+                url,
+                timeout=timeout,
+                ssl=ssl_policy,
+                allow_redirects=allow_redirects,
+                headers=headers,
+            ) as response:
+                body = await response.read()
+                return WebResponse(
+                    url=url,
+                    status=response.status,
+                    headers=dict(response.headers),
+                    body=body,
+                    proxy=redact_proxy_url(node.url),
+                )
         # HTTP proxy via aiohttp native
         proxy_arg = node.url if node.kind == EgressKind.PROXY else None
         async with session.get(
@@ -1156,7 +1175,7 @@ class WebRequestController:
                 proxies=proxies,
                 allow_redirects=allow_redirects,
                 timeout=total_timeout,
-                verify=False,
+                verify=True,
             )
             body = r.content if isinstance(r.content, bytes) else (r.content or b"")
             return WebResponse(
@@ -1343,9 +1362,9 @@ class AsyncConnectScanner:
         print(Fore.GREEN + f"\nOpen ports found: {len(open_ports)} in {elapsed:.1f}s")
         return sorted(open_ports)
 class _UdpProbeProtocol(asyncio.DatagramProtocol):
-    def __init__(self) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.transport: asyncio.DatagramTransport | None = None
-        self.response: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
+        self.response: asyncio.Future[bytes] = loop.create_future()
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
         self.transport = transport  # type: ignore[assignment]
     def datagram_received(self, data: bytes, _addr) -> None:
@@ -1363,7 +1382,7 @@ class UdpScanner:
         transport = None
         try:
             transport, protocol = await loop.create_datagram_endpoint(
-                _UdpProbeProtocol,
+                lambda: _UdpProbeProtocol(loop),
                 remote_addr=(self.target.address, port),
                 family=self.target.family,
             )
@@ -1974,15 +1993,17 @@ class DiffEngine:
         path = Path(old_report_path)
         if not path.is_absolute():
             path = base_path / path
-        path = path.resolve()
-        try:
-            path.relative_to(base_path)
-        except ValueError:
-            return [f"Rejected compare path outside output directory: {path}"]
         if path.suffix.lower() != ".json":
             return [f"Rejected compare path with non-JSON extension: {path}"]
         if not path.exists():
             return [f"Previous report not found: {path}"]
+        path = path.resolve(strict=True)
+        try:
+            path.relative_to(base_path)
+        except ValueError:
+            return [f"Rejected compare path outside output directory: {path}"]
+        if not path.is_file():
+            return [f"Rejected compare path that is not a file: {path}"]
         with path.open("r", encoding="utf-8") as handle:
             old_report = json.load(handle)
         old_ports = {int(item["port"]): item for item in old_report.get("ports", [])}
@@ -2223,7 +2244,7 @@ class BlueScanner:
         return state
     def _build_decoy_paths(self) -> list[str]:
         if self.state.discovered_decoy_paths:
-            return list(self.state.discovered_decoy_paths)
+            return sorted(self.state.discovered_decoy_paths)
         return list(DECOY_FALLBACK_PATHS)
     def _select_scan_mode(self) -> str:
         if self.args.web_only:
@@ -2278,7 +2299,7 @@ class BlueScanner:
             open_ports = self.ports
             os_hints: dict[int, str] = {}
         elif self.scan_mode == "syn":
-            open_ports = await asyncio.get_event_loop().run_in_executor(None, self._run_syn_scan)
+            open_ports = await asyncio.get_running_loop().run_in_executor(None, self._run_syn_scan)
             os_hints = getattr(self, "_syn_os_hints", {})
         else:
             scanner = AsyncConnectScanner(
@@ -2308,6 +2329,7 @@ class BlueScanner:
                 results = await detector.detect(open_ports)
         finally:
             await cve_lookup.aclose()
+            await self.web_controller.aclose()
         for port, hint in os_hints.items():
             if port in results:
                 results[port].os_hint = hint
