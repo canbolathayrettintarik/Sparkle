@@ -1,0 +1,4 @@
+httpx
+asyncio_throttle
+aiohttp
+customtkinter
